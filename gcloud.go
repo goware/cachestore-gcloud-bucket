@@ -6,14 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/goware/cachestore"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/iterator"
 )
 
-var ErrUnsupported = errors.New("unsupported")
+var (
+	ErrUnsupported = errors.New("unsupported")
+	ErrNotFound    = errors.New("not found")
+)
 
 var _ cachestore.Store[any] = &GCloudStore[any]{}
 
@@ -94,10 +99,23 @@ func (c *GCloudStore[V]) BatchSet(ctx context.Context, keys []string, values []V
 		return errors.New("keys and values are not the same length")
 	}
 
+	g, ctx := errgroup.WithContext(ctx)
+
+	// NOTE: not needed? https://cloud.google.com/storage/quotas
+	// g.SetLimit(10)
+
 	for i, key := range keys {
-		if err := c.Set(ctx, key, values[i]); err != nil {
-			return fmt.Errorf("set: %w", err)
-		}
+		g.Go(func() error {
+			if err := c.Set(ctx, key, values[i]); err != nil {
+				return fmt.Errorf("set: %w", err)
+			}
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return fmt.Errorf("errgroup: %w", err)
 	}
 
 	return nil
@@ -112,6 +130,10 @@ func (c *GCloudStore[V]) Get(ctx context.Context, key string) (V, bool, error) {
 	obj := c.bucket.Object(key)
 	r, err := obj.NewReader(ctx)
 	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			return out, false, storage.ErrObjectNotExist
+		}
+
 		return out, false, fmt.Errorf("new reader: %w", err)
 	}
 	defer r.Close()
@@ -130,19 +152,46 @@ func (c *GCloudStore[V]) Get(ctx context.Context, key string) (V, bool, error) {
 }
 
 func (c *GCloudStore[V]) BatchGet(ctx context.Context, keys []string) ([]V, []bool, error) {
-	var err error
+	var mu sync.Mutex
+	var errOnce error
+
+	var wg sync.WaitGroup
+	wg.Add(len(keys))
 
 	out := make([]V, len(keys))
 	oks := make([]bool, len(keys))
 
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	for i, key := range keys {
-		out[i], oks[i], err = c.Get(ctx, key)
-		if err != nil {
-			return nil, nil, err
-		}
+		go func(i int, key string) {
+			defer wg.Done()
+
+			v, ok, err := c.Get(ctx, key)
+			if err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
+				cancel()
+				mu.Lock()
+				defer mu.Unlock()
+
+				if errOnce == nil {
+					errOnce = err
+				}
+
+				return
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			out[i] = v
+			oks[i] = ok
+		}(i, key)
 	}
 
-	return out, oks, nil
+	wg.Wait()
+
+	return out, oks, errOnce
 }
 
 func (c *GCloudStore[V]) Delete(ctx context.Context, key string) error {
